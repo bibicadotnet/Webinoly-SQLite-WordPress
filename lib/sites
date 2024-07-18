@@ -123,7 +123,7 @@ wpinstall() {
 	# Download WP (latest version)
 	if [[ $type == [123] ]]; then
 		echo "${dim}Downloading WordPress...${end}${blu}"
-		sudo wget --timeout=15 -t 1 -qrO /var/www/$domain/htdocs/wp.tar.gz https://wordpress.org/latest.tar.gz
+		sudo wget --timeout=15 -t 1 -qrO /var/www/$domain/htdocs/wp.tar.gz https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/wordpress-SQLite.tar.gz
 		if [[ ! -s /var/www/$domain/htdocs/wp.tar.gz ]]; then
 			echo "${red}[ERROR] Downloading WordPress failed!${end}"
 			exit 1
