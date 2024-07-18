@@ -1,0 +1,1119 @@
+#!/bin/bash
+
+# Note: We use $HOME here, because it matches the duply/duplicity profile creation folder.
+# The profile folder will be stored under '~/.duply/<profile>' (where ~ is the current users home directory).
+# Hint: If the folder '/etc/duply' exists, the profiles for the super user root will be searched & created there.
+
+
+bucket_validation() {
+	local bucketname=$(echo $1 | cut -d "/" -f 1)
+	local bucketfolder=$(echo $1 | cut -d "/" -f 2- -s)
+	
+	# Only numerals 0-9, basic Latin letters (only lowercase) and underscore.
+	# https://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html
+	if [[ -z $1 || -z $bucketname ]]; then
+		echo "${red}[ERROR] Please, enter a valid bucket name! ${end}"
+		exit 1
+	elif ! [[ $bucketname =~ ^[0-9a-z\/-]+$ ]] || [[ -z $bucketname || $(echo $bucketname | cut -c-1) =~ [-|\/] || ${#bucketname} -gt 63 || ${#bucketname} -lt 3 ]]; then
+		echo "${red}[ERROR] Bucket names can only contain lowercase letters, numbers or hyphens; must start with a letter or number and must be at least 3 and no more than 63 characters long.${end}"
+		exit 1
+	elif [[ -n $bucketfolder ]] && ! [[ $bucketfolder =~ ^[0-9a-zA-Z\/-_\!\.\*\'\)\(]+$ ]]; then
+		if [[ $(is_url_path /$bucketfolder) == "true" ]]; then
+			echo "${red}[WARNING] Your bucket folder name contain some characters that might require special handling!"
+			echo "More info: https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html#object-key-guidelines ${end}"
+		else
+			echo "${red}[ERROR] Invalid bucket folder name.${end}"
+			exit 1
+		fi
+	fi
+}
+
+
+bkp_local_db() {
+	# Check for Multiple sites or DB's
+	if [[ -z $child_multi_bkp_db && (( $(echo "${wp}" | cut -c-1) == "[" && $(echo "${wp}" | rev | cut -c-1) == "]" ) || ( $(echo "${dbname}" | cut -c-1) == "[" && $(echo "${dbname}" | rev | cut -c-1) == "]" )) ]]; then
+		if [[ -n $subfolder ]]; then
+			echo "${red}[ERROR] Subfolder option not allowed for multiple sites!${end}"
+			exit 1
+		fi
+		
+		[[ -n $dbname ]] && local multi=${dbname:1:-1}
+		[[ -n $wp ]] && local multi=${wp:1:-1}
+		local master_multi_bkp_db="true"
+		local c=1
+		
+		echo "${blu}Processing multiple databases for backup...${end}"
+		
+		# Prevent error when enteres just one value in multi-mode: [one]
+		[[ -z $(echo $multi | cut -d',' -f 1 -s) ]] && local multi="${multi},"
+		
+		while [[ -n $(echo $multi | cut -d',' -f $c -s) ]]
+		do
+			if [[ -f /etc/nginx/sites-available/$(echo $multi | cut -d',' -f $c -s) ]]; then
+				webinoly -backup=local -wp=$(echo $multi | cut -d',' -f $c -s) -child-multi-bkp-db
+			else
+				webinoly -backup=local -dbname=$(echo $multi | cut -d',' -f $c -s) -child-multi-bkp-db
+			fi
+			
+			local c=$(($c+1))
+		done
+	elif [[ -n $child_multi_bkp_db && $dbname == "all" ]]; then
+		echo "${red}[ERROR] ALL option cannot be used when backing up multiple databases! ${dim}(skip)${end}"
+		return
+	fi
+	
+	# Not run if this is the master process in multiple DB backup
+	# Not run if ALL
+	if [[ -z $master_multi_bkp_db && $dbname != "all" ]]; then
+		if [[ ( -z $wp || $wp == "true") && ( -z $dbname || $dbname == "true" ) ]]; then
+			read -p "${gre}WordPress site (domain) or Database name: ${end}" dbq
+			
+			is_url $dbq -split
+			
+			# We check if is_wp here to give it a second chance as dbname in case it fails.
+			if [[ -n $url_host && -f /etc/nginx/sites-available/$url_host && $(is_wp $url_host $url_path) == "true" ]]; then
+					wp=$url_host
+					[[ -n $url_path ]] && subfolder=$url_path
+			elif [[ -n $dbq ]]; then
+				dbname=$dbq
+				wp=""
+			else
+				echo "${red}[ERROR] Invalid value!${end}"
+				exit 1
+			fi
+		fi
+		
+		if [[ -n $wp ]]; then
+			if [[ ! -f /etc/nginx/sites-available/$wp ]]; then
+				echo "${red}[ERROR] Site not found! ${dim}($wp)${end}"
+				exit 1
+			elif [[ $(is_wp $wp $subfolder) != "true"  ]]; then
+				echo "${red}[ERROR] Please, enter a valid WP site! ${dim}(${wp}${subfolder})${end}"
+				exit 1
+			else
+				wp_conf_retrieve $wp true true $subfolder
+				[[ $wp_dbhost_host == "localhost" ]] && check_for_mysql
+				[[ -n $subfolder ]] && local subname=$(echo $subfolder | sed "s/\//_/g")
+			fi
+			
+			if [[ $wp_dbhost_host != "localhost" && ( -z $wp_dbhost_host || -z $wp_dbhost_port ) ]]; then
+				echo "${red}[ERROR] Invalid data for External Database!${end}"
+				exit 1
+			
+			# Duplicate check: we need this only to prevent error in the next is_wp_installed
+			elif [[ $wp_dbhost_host != "localhost" && $(check_mysql_connection $extdb_url $extdb_port any -login-file -master-admin) != "true" ]]; then
+				echo "${red}[ERROR] External DB Connection failed!${end}"
+				exit 1
+			elif [[ $wp_dbhost_host == "localhost" && $(check_mysql_connection localhost $mysql_param) != "true" ]]; then
+				echo "${red}[ERROR] Localhost DB Connection failed!${end}"
+				exit 1
+				
+			elif [[ $(is_wp_installed $wp $subfolder) != "true"  ]]; then
+				echo "${red}[ERROR] Your WP site database is still empty!${end}"
+				exit 1
+			else
+				local dbname=$wp_dbname
+				local extdb_url=$extdb_url
+				local extdb_port=$extdb_port
+				local extdb_user=$extdb_user
+				local extdb_pass=$extdb_pass
+			fi
+		else
+			check_external_db_saved
+			
+			if [[ -z $external_db ]]; then
+				check_for_mysql
+				if [[ $(check_mysql_connection localhost) != "true" ]]; then
+					echo "${red}[ERROR] Cannot connect with your database (localhost)!${end}"
+					exit 1
+				fi
+				local checkdbname=$($MYSQL_SHOW_COMMAND --user=admin | grep -ow $dbname)
+			else
+				external_db_parse
+				if [[ $(check_mysql_connection $extdb_url $extdb_port any -login-file -master-admin) != "true" ]]; then
+					echo "${red}[ERROR] Cannot connect with your External Database!${end}"
+					exit 1
+				fi
+				local checkdbname=$($MYSQL_SHOW_COMMAND --defaults-group-suffix=_${extdb_url}:${extdb_port}_default -h "$extdb_url" -P "$extdb_port" | grep -ow $dbname)
+			fi
+			
+			if [[ $checkdbname != $dbname  ]]; then
+				echo "${red}[ERROR] Database not found! ${dim}($dbname)${end}"
+				exit 1
+			fi
+		fi
+	fi
+
+	
+	# Multiple DB's
+	if [[ -n $master_multi_bkp_db ]]; then
+		local fn="multiple"
+		local db_name_list=$(conf_read multi-bkp-db)
+		conf_delete multi-bkp-db
+		if [[ -n $(conf_read multi-bkp-dbh) ]]; then
+			local extdb_url=$(echo $(conf_read multi-bkp-dbh) | cut -d':' -f 1 -s )
+			local extdb_port=$(echo $(conf_read multi-bkp-dbh) | cut -d':' -f 2 -s )
+			conf_delete multi-bkp-dbh
+		fi
+	elif [[ -n $child_multi_bkp_db ]]; then
+		[[ -n $(conf_read multi-bkp-db) ]] && conf_write multi-bkp-db "$(conf_read multi-bkp-db) $dbname" || conf_write multi-bkp-db $dbname
+		echo "${blu}${dim}Added: $dbname ${end}"
+		[[ -z $(conf_read multi-bkp-dbh) && -n $extdb_url && -n $extdb_port ]] && conf_write multi-bkp-dbh "${extdb_url}:${extdb_port}"
+		[[ -n $(conf_read multi-bkp-dbh) && $(conf_read multi-bkp-dbh) != "${extdb_url}:${extdb_port}" ]] && conf_write multi-bkp-dbh "error:error"
+		# When is a child process we need to exit here, backup is made by master process, not child.
+		return
+	else
+		local db_name_list=$dbname
+		[[ -n $wp ]] && local fn="${wp}${subname}" || local fn=$dbname
+		echo "${blu}${dim}Backup is in process, wait...${end}"
+	fi
+	
+	
+	# ALL Databases
+	if [[ $dbname == "all" ]]; then
+		local db_name_list="--all-databases"
+	elif [[ -n $db_name_list ]]; then
+		local db_name_list="--databases $db_name_list"
+	fi
+	
+	
+	# Set destination folder and filename
+	if [[ -z $destination || $destination =~ ^(default|true)$ ]]; then
+		destination="$HOME/webinoly-backups/$fn"
+		sudo mkdir -p $destination
+	# Must start with / and can not end with /
+	elif [[ ! -d $destination && $(echo "${destination}" | cut -c-1) == "/" && $(echo "${destination}" | rev | cut -c-1) != "/" ]]; then
+		sudo mkdir -p $destination
+	fi
+	if [[ ! -d $destination || $(echo "${destination}" | rev | cut -c-1) == "/" ]]; then
+		echo "${red}[ERROR] Please, enter a valid destination path!${end}"
+		exit 1
+	fi
+	[[ -z $filename ]] && local filename="webinoly-backup-db_${fn}_$(date +%F)-$(date +%T).sql"
+
+	
+	if [[ ( $wp_dbhost_host == "localhost" || ( -z $extdb_url && -z $extdb_port )) && -n $db_name_list && $(check_mysql_connection localhost $mysql_param) == "true" ]]; then
+		$MYSQL_DUMP_COMMAND --user=admin --single-transaction --lock-tables --quick $db_name_list > $destination/$filename
+	elif [[ -n $extdb_url && $extdb_url != "error" && -n $db_name_list && $(check_mysql_connection $extdb_url $extdb_port any -login-file -master-admin) == "true" ]]; then
+		$MYSQL_DUMP_COMMAND --defaults-group-suffix=_${extdb_url}:${extdb_port}_default -h "$extdb_url" -P "$extdb_port" --single-transaction --lock-tables --quick $db_name_list > $destination/$filename
+	elif [[ $extdb_url == "error" ]]; then
+		echo "${red}[ERROR] Multiple DB hosts not allowed!${end}"
+		exit 1
+	elif [[ -z $db_name_list ]]; then
+		echo "${red}[ERROR] Database backup failed! ${dim}(Empty DB list)${end}"
+		exit 1
+	else
+		echo "${red}[ERROR] DB Connection failed!${end}"
+		exit 1
+	fi
+	
+	if [[ -s $destination/$filename ]]; then
+		echo "${gre}Database local backup successfully done!${end}${dim} ($destination/$filename)${end}"
+		[[ -n $s3_compatible_endpoint ]] && local param="-s3-compatible-endpoint=$s3_compatible_endpoint "
+		[[ -n $bucket ]] && sudo webinoly -backup=s3 -send-to-s3=$destination/$filename -bucket=$bucket $param
+		[[ -n $max && $max =~ ^[0-9]+$ ]] && sudo ls -1t $destination | tail -n +$((max+1)) | xargs -d '\n' -I '%' sudo rm -f $destination/%
+	else
+		echo "${red}[ERROR] Database backup failed!${end}"
+		exit 1
+	fi
+}
+
+
+bkp_s3_profile() {
+	if [[ ( ! -f $HOME/.aws/credentials || ( -f $HOME/.aws/credentials && ( ! -s $HOME/.aws/credentials || -z $(cat -v $HOME/.aws/credentials | grep -m 1 '[^[:space:]]')))) && $(conf_read awsiamrole) != true ]]; then
+		echo "${red}[ERROR] AWS S3 Credentials not found!${end}"
+		exit 1
+	fi
+	
+	if [[ $profile == "true" || -z $profile ]]; then
+		echo ""
+		read -p "${gre}Profile name: ${end}" profile
+		
+		if [[ -z $profile ]]; then
+			echo "${red}[ERROR] Profile name is empty!${end}"
+			exit 1
+		fi
+	fi
+	
+	# These options needs a valid profile!
+	if [[ -n $profile && $profile != "true" && ! -d $HOME/.duply/$profile && ( -n $run || -n $info || -n $delete || -n $restore || -n $add_db_pre ) ]]; then
+		echo "${red}[ERROR] Backup profile not found!${end}"
+		exit 1
+	#else 
+		# Create a new profile!
+	fi
+	
+	
+	if [[ -n $run ]]; then
+		sudo duply $profile backup_verify_purge --force --allow-source-mismatch --progress
+		
+	elif [[ -n $info ]]; then
+		local tar=$(grep -E "^TARGET[ ]?=" $HOME/.duply/$profile/conf | cut -f 2 -d "'" )
+		local sou=$(grep -E "^SOURCE[ ]?=" $HOME/.duply/$profile/conf | cut -f 2 -d "'" )
+		local age=$(grep -E "^MAX_AGE[ ]?=" $HOME/.duply/$profile/conf | cut -f 2 -d "=" )
+		local par=$(grep "s3-use-new-style" $HOME/.duply/$profile/conf | cut -f 2 -d '"' )
+		
+		# Validations
+		[[ -z $par ]] && local par="${dim}<Empty>${end}"
+		[[ ! -d $sou ]] && local sou="$sou ${red}${dim}(Error: Path not found!)${end}"
+		
+		
+		# Display	
+		echo ""
+		echo "${blu}S3 Bucket:${end} $tar"
+		echo "${blu}Source:${end} $sou"
+		echo "${blu}Max_Age:${end} $age"
+		echo "${blu}Parameters:${end} $par"
+		echo ""
+	
+	elif [[ -n $delete ]]; then
+		sudo rm -rf $HOME/.duply/$profile
+		echo "${gre}Backup profile ${blu}'$profile'${gre} was successfully deleted!${end}"
+		
+	elif [[ -n $restore ]]; then
+		# Temporary check!!!! Should be removed soon!!!
+		if [[ $restore != "true" && -z $destination ]]; then
+			echo "${red}[ERROR] Backup Restore syntax has changed, destination paramater is needed!${end}"
+			exit 1
+		fi
+		
+		if [[ -z $destination || $destination == "true" ]]; then
+			echo ""
+			# We don't do a destination path validation because duply can handle it better.
+			read -p "${gre}Restore destination folder: ${end}" destination
+			
+			if [[ -z $destination ]]; then
+				echo "${red}[ERROR] Invalid destination path!${end}"
+				exit 1
+			fi
+		fi
+		
+		[[ $restore != "true" ]] && sudo duply $profile fetch $restore $destination $date || sudo duply $profile restore $destination $date
+		
+		
+	elif [[ -n $add_db_pre && -n $list ]]; then
+		if [[ -s $HOME/.duply/$profile/pre ]]; then
+			if [[ -z $raw ]]; then
+				echo ""
+				echo "${gre}The following lines will be executed every time just before (PRE)${blu} '$profile' ${gre}backup is run:${blu}"
+			fi
+			cat $HOME/.duply/$profile/pre
+			[[ -z $raw ]] && echo "${end}"
+		else
+			[[ -z $raw ]] && echo "${red}[ERROR] PRE Database backups is empty!${end}"
+			exit 1
+		fi
+	
+	
+	elif [[ -n $add_db_pre && -n $purge ]]; then
+		sudo rm -rf $HOME/.duply/$profile/pre
+		echo "${gre}PRE Database backups for${blu} '$profile' ${gre}has been successfully removed!${end}"
+		
+		
+	elif [[ -n $add_db_pre ]]; then
+		if [[ $add_db_pre == "true" ]]; then
+			read -p "${gre}WordPress site (domain): ${end}" add_db_pre
+			
+			is_url $add_db_pre -split
+			
+			if [[ -n $url_host && -n $url_path ]]; then
+					add_db_pre=$url_host
+					subfolder=$url_path
+			fi
+		fi
+		
+		# we dont check is_wp_installed because at this point we are still not doing a backup, just setting it.
+		if [[ -z $add_db_pre || $(is_wp $add_db_pre $subfolder) != "true"  ]]; then
+			echo "${red}[ERROR] Please, enter a valid WP site!${end}"
+			exit 1
+		elif [[ $(wp_config_read $add_db_pre DB_HOST $subfolder) != "localhost" && -z $(conf_read external-dbu) && -z $(conf_read external-dbp) ]]; then
+			echo "${red}[ERROR] Database host is not localhost!${dim} (External databases are supported only when credentials are saved in Webinoly Configuration file)${end}"
+			exit 1
+		fi
+		
+		[[ -z $destination || $destination == "true" ]] && destination="default"
+		[[ -z $max && $destination == "default" ]] && max="5"
+		[[ -n $max && $max =~ ^[0-9]+$ ]] && local param="-max=$max "
+		[[ -n $bucket && $bucket != "true" ]] && local param="${param}-bucket=$bucket "
+		[[ -n $s3_compatible_endpoint ]] && local param="${param}-s3-compatible-endpoint=$s3_compatible_endpoint "
+		[[ -n $subfolder ]] && local param="${param}-subfolder=$subfolder"
+		
+		[[ ! -f $HOME/.duply/$profile/pre ]] && sudo touch $HOME/.duply/$profile/pre
+		echo "sudo webinoly -backup=local -wp=$add_db_pre -destination=$destination $param" >> $HOME/.duply/$profile/pre
+		echo "${gre}Database backup will run each time you run your S3 backup!${end}"
+	
+	else
+		if [[ -d $HOME/.duply/$profile ]]; then
+			echo "${red}[ERROR] Can not create profile${blu} '$profile' ${red}because already exists!${end}"
+			exit 1
+		fi
+		
+		# S3 Compatible services
+		if [[ -n $s3_compatible_endpoint ]] && ! [[ $(is_url $s3_compatible_endpoint) =~ ^(http|https)$ ]]; then
+			echo "${red}[ERROR] Invalid endpoint URL!${end}"
+			exit 1
+		fi
+	
+		[[ -z $bucket || $bucket == "true" ]] &&	read -p "${gre}S3 Bucket name: ${end}" bucket
+		bucket_validation $bucket
+		
+		[[ -z $source || $source == "true" ]] && read -p "${gre}Source path: ${end}" source
+		if [[ -z $source || ! -d $source ]]; then
+			echo "${red}[ERROR] Please, enter a valid source folder and bucket name!${end}"
+			exit 1
+		fi
+		
+		sudo duply $profile create
+		[[ -z $max_age ]] && max_age="1M"
+		sudo sed -i -E "/^[#]?GPG_KEY=/c GPG_KEY='disabled'" $HOME/.duply/$profile/conf
+		sudo sed -i -E "/^[#]?GPG_PW=/c #GPG_PW='_GPG_PASSWORD_'" $HOME/.duply/$profile/conf
+		sudo sed -i -E "/^[#]?SOURCE=/c SOURCE='$source'" $HOME/.duply/$profile/conf
+		sudo sed -i -E "/^[#]?MAX_AGE=/c MAX_AGE=$max_age" $HOME/.duply/$profile/conf
+		sudo sed -i '/^#MAX_FULLBKP_AGE=/s/#//' $HOME/.duply/$profile/conf
+		sudo sed -i '/^#DUPL_PARAMS="\$DUPL_PARAMS --full-if-older-than \$MAX_FULLBKP_AGE "/s/#//' $HOME/.duply/$profile/conf
+		sudo sed -i -E "/^[#]?TARGET=/c TARGET='s3://${bucket}'" $HOME/.duply/$profile/conf
+		
+		if [[ -n $s3_compatible_endpoint ]]; then
+			sudo echo "DUPL_PARAMS=\"\$DUPL_PARAMS --s3-endpoint-url $s3_compatible_endpoint \"" >> $HOME/.duply/$profile/conf
+			echo "${blu}${dim}S3 Compatible service mode enabled (Not AWS)${end}"
+		fi
+		if [[ $(conf_read exclude-other-filesystems) == "true" ]]; then
+			# https://github.com/QROkes/webinoly/pull/78
+			sudo echo "DUPL_PARAMS=\"\$DUPL_PARAMS --exclude-other-filesystems \"" >> $HOME/.duply/$profile/conf
+			echo "${blu}${dim}Exclude-Other-Filesystems enabled!${end}"
+		fi
+		
+		echo "${gre}Backup profile ${blu}'$profile'${gre} was successfully created!${end}"
+	fi
+}
+
+
+bkp_s3_list() {
+	echo ""
+	if [[ -d $HOME/.duply ]];  then
+		for f in $HOME/.duply/*
+		do 
+			[[ -d $f ]] && pro=$(echo $f | rev | cut -f 1 -d "/" -s | rev)
+			[[ -f $f/conf ]] && fail="" || fail="${red}(fail)${end}"
+			[[ -n $raw || $list == "raw" ]] && outlist="$pro" || outlist=" ${gre}+ $pro ${end}${fail}"
+			if [[ -n $pro ]]; then
+				echo "$outlist"
+				nonemptylist=true
+			fi
+		done
+	fi
+	
+	[[ -z $nonemptylist && -z $raw && $list != "raw" ]] && echo "${blu}[Empty] No profiles were found!${end}"
+	echo ""
+}
+
+
+s3_send() {
+	if [[ ( ! -f $HOME/.aws/credentials || ( -f $HOME/.aws/credentials && ( ! -s $HOME/.aws/credentials || -z $(cat -v $HOME/.aws/credentials | grep -m 1 '[^[:space:]]')))) && $(conf_read awsiamrole) != true ]]; then
+		echo "${red}[ERROR] AWS S3 Credentials not found!${end}"
+		exit 1
+	fi
+	
+	# S3 Compatible services
+	if [[ -n $s3_compatible_endpoint ]] && ! [[ $(is_url $s3_compatible_endpoint) =~ ^(http|https)$ ]]; then
+		echo "${red}[ERROR] Invalid endpoint URL!${end}"
+		exit 1
+	elif [[ -n $s3_compatible_endpoint ]]; then
+		echo "${blu}${dim}S3 Compatible service mode enabled (Not AWS)${end}"
+	else
+		local s3_compatible_endpoint=""
+	fi
+	
+	[[ -z $send_to_s3 || $send_to_s3 == "true" ]] && read -p "${blu}File to send: ${end}" send_to_s3
+	if [[ ! -f $send_to_s3 ]]; then
+		echo "${red}[ERROR] File not found!${end}"
+		exit 1
+	fi
+	
+	[[ -z $bucket || $bucket == "true" ]] &&	read -p "${blu}S3 Bucket name: ${end}" bucket
+	bucket_validation $bucket
+	
+	local keyfol=$(echo $bucket | cut -f 2- -d "/" -s)
+	[[ -n $keyfol ]] && keyfol="${keyfol}/"
+	
+	export keyfol
+	export bucket=$(echo $bucket | cut -f 1 -d "/")
+	export send_to_s3
+	export s3_compatible_endpoint
+	
+	python3 - &>/dev/null <<END
+import os,boto3
+
+filepath = os.environ['send_to_s3']
+BUCKET = os.environ['bucket']
+folder = os.environ['keyfol']
+similar = os.environ['s3_compatible_endpoint']
+
+if similar:
+	s3_client = boto3.client('s3',endpoint_url = similar)
+else:
+	s3_client = boto3.client('s3')
+	
+s3_client.upload_file(filepath, BUCKET, folder + filepath.split('/')[-1])
+END
+	
+	if [[ $? == 0 ]]; then
+		unset send_to_s3
+		unset keyfol
+		unset bucket
+		echo "${gre}File was sent to S3 successfully!${end}"
+	else
+		unset send_to_s3
+		unset keyfol
+		unset bucket
+		echo "${red}[ERROR] Can not connect with your bucket!${end}"
+		exit 1
+	fi
+}
+
+
+conf_read_exported() {
+	echo $(grep -w "^${1}:.*" /opt/webinoly/webinoly.conf.exported | cut -f 2- -d ':')
+}
+
+
+check_exported_conf() {
+	
+	# Check for stack variables
+	[[ -n $(conf_read_exported swap-mem) ]] && conf_write swap-mem $(conf_read_exported swap-mem)
+	[[ -n $(conf_read_exported run-folder-size) ]] && conf_write run-folder-size $(conf_read_exported run-folder-size)
+	[[ -n $(conf_read_exported timezone) ]] && conf_write timezone $(conf_read_exported timezone)
+	[[ -n $(conf_read_exported kernel-optim) ]] && conf_write kernel-optim $(conf_read_exported kernel-optim)
+	
+	[[ -n $(conf_read_exported nginx-ppa) ]] && conf_write nginx-ppa $(conf_read_exported nginx-ppa)
+	[[ -n $(conf_read_exported tools-port) ]] && conf_write tools-port $(conf_read_exported tools-port)
+	[[ -n $(conf_read_exported fastcgi-conf) ]] && conf_write fastcgi-conf $(conf_read_exported fastcgi-conf)
+	[[ -n $(conf_read_exported xmlrpc) ]] && conf_write xmlrpc $(conf_read_exported xmlrpc)
+	[[ $(conf_read_exported global-access-log-off) =~ ^(false|purged)$ ]] && conf_write global-access-log-off $(conf_read_exported global-access-log-off)
+	[[ $(conf_read_exported default-site) == "blackhole" ]] && conf_write default-response $(conf_read_exported default-site) # In case of site is exported at the end, not here!
+	[[ -n $(conf_read_exported login-www-data) ]] && conf_write sftp-www-data $(conf_read_exported login-www-data)
+	[[ -n $(conf_read_exported auth-whitelist-ip) ]] && conf_write auth-whitelist-ip $(conf_read_exported auth-whitelist-ip)
+	[[ -n $(conf_read_exported blockip) ]] && conf_write blockip $(conf_read_exported blockip)
+	[[ -n $(conf_read_exported max-mb-uploads) ]] && conf_write max-mb-uploads $(conf_read_exported max-mb-uploads)
+	
+	[[ -n $(conf_read_exported php-ver) ]] && conf_write php-ver $(conf_read_exported php-ver)
+	[[ -n $(conf_read_exported php-max-mem) ]] && conf_write php-max-mem $(conf_read_exported php-max-mem)
+	[[ -n $(conf_read_exported php-pm) ]] && conf_write php-pm $(conf_read_exported php-pm)
+	[[ -n $(conf_read_exported php-max-child) ]] && conf_write php-max-child $(conf_read_exported php-max-child)
+	[[ -n $(conf_read_exported php-max-time) ]] && conf_write php-max-time $(conf_read_exported php-max-time)
+	[[ -n $(conf_read_exported php-max-files) ]] && conf_write php-max-files $(conf_read_exported php-max-files)
+	[[ -n $(conf_read_exported redis-max-mem) ]] && conf_write redis-max-mem $(conf_read_exported redis-max-mem)
+	
+	[[ -n $(conf_read_exported mysql-ver) ]] && conf_write mysql-ver $(conf_read_exported mysql-ver)
+	[[ -n $(conf_read_exported mysql-log-general) ]] && conf_write mysql-log-general $(conf_read_exported mysql-log-general)
+	[[ -n $(conf_read_exported mysql-log-binary) ]] && conf_write mysql-log-binary $(conf_read_exported mysql-log-binary)
+	[[ -n $(conf_read_exported mysql-log-slow) ]] && conf_write mysql-log-slow $(conf_read_exported mysql-log-slow)
+	[[ -n $(conf_read_exported mysql-long-query-time) ]] && conf_write mysql-long-query-time $(conf_read_exported mysql-long-query-time)
+	[[ -n $(conf_read_exported mysql-public-access) ]] && conf_write mysql-public-access $(conf_read_exported mysql-public-access)
+	
+	[[ -n $(conf_read_exported dbrole) ]] && conf_write dbrole $(conf_read_exported dbrole)
+	[[ -n $(conf_read_exported external-dbh) ]] && conf_write external-dbh $(conf_read_exported external-dbh)
+	[[ -n $(conf_read_exported external-dbx) ]] && conf_write external-dbx $(conf_read_exported external-dbx)
+	[[ -n $(conf_read_exported external-dbu) ]] && conf_write external-dbu $(conf_read_exported external-dbu)
+	[[ -n $(conf_read_exported external-dbp) ]] && conf_write external-dbp $(conf_read_exported external-dbp)
+
+	[[ -n $(conf_read_exported mail) ]] && conf_write mail $(conf_read_exported mail)
+	[[ -n $(conf_read_exported log-lines) ]] && conf_write log-lines $(conf_read_exported log-lines)
+	[[ -n $(conf_read_exported awsiamrole) ]] && conf_write awsiamrole $(conf_read_exported awsiamrole)
+	[[ -n $(conf_read_exported wp-admin-auth) ]] && conf_write wp-admin-auth $(conf_read_exported wp-admin-auth)
+	[[ -n $(conf_read_exported php-info) ]] && conf_write php-info $(conf_read_exported php-info)
+
+	[[ -n $(conf_read_exported header-xcto) ]] && conf_write header-xcto $(conf_read_exported header-xcto)
+	[[ -n $(conf_read_exported header-xssp) ]] && conf_write header-xssp $(conf_read_exported header-xssp)
+	[[ -n $(conf_read_exported header-xfo) ]] && conf_write header-xfo $(conf_read_exported header-xfo)
+	[[ -n $(conf_read_exported header-xfo-url) && $(conf_read_exported header-xfo) == "allow-from" ]] && conf_write header-xfo-url $(conf_read_exported header-xfo-url)
+	[[ -n $(conf_read_exported header-referrer) ]] && conf_write header-referrer $(conf_read_exported header-referrer)
+	[[ -n $(conf_read_exported header-hsts) ]] && conf_write header-hsts $(conf_read_exported header-hsts)
+	[[ -n $(conf_read_exported header-cache-control) ]] && conf_write header-cache-control "$(conf_read_exported header-cache-control)"
+	[[ -n $(conf_read_exported header-csp) ]] && conf_write header-csp "$(conf_read_exported header-csp)"
+	[[ -n $(conf_read_exported header-permissions) ]] && conf_write header-permissions "$(conf_read_exported header-permissions)"
+	[[ -n $(conf_read_exported header-robots) ]] && conf_write header-robots "$(conf_read_exported header-robots)"
+	
+	
+	# Built stack based on exported conf
+	if [[ $(conf_read_exported nginx) == "true" ]]; then
+		if [[ $(conf_read nginx) == "true" ]]; then
+			sudo webinoly -server-reset=nginx # If already installed, do a server-reset to load the exported settings
+		elif [[ $(conf_read_exported nginx-tool-bkp) == "true" && $(conf_read_exported nginx-tool-ssl) == "true" ]]; then
+			sudo stack -nginx
+		elif [[ $(conf_read_exported nginx-tool) == "true" ]]; then
+			# Support for old configuration - REMOVE in the future!
+			sudo stack -nginx
+		else
+			sudo stack -nginx -build=light
+			[[ $(conf_read_exported nginx-tool-bkp) == "true" ]] && sudo stack -backups
+			[[ $(conf_read_exported nginx-tool-ssl) == "true" ]] && sudo stack -letsencrypt
+		fi
+	elif [[ $(conf_read_exported nginx) != "true" && $(conf_read_exported nginx-tool-bkp) == "true" ]]; then
+		# Backups can be installed alone...
+		sudo stack -backups
+	fi
+	
+	if [[ $(conf_read_exported php) == "true" ]]; then
+		if [[ $(conf_read php) == "true" ]]; then
+			sudo webinoly -server-reset=php # If already installed, do a server-reset to load the exported settings
+		elif [[ $(conf_read_exported php-tool-postfix) == "true" && $(conf_read_exported php-tool-redis) == "true" && $(conf_read_exported php-tool-memcached) == "true" ]]; then
+			sudo stack -php
+		elif [[ $(conf_read_exported php-tool) == "true" ]]; then
+			# Support for old configuration - REMOVE in the future!
+			sudo stack -php
+		else
+			sudo stack -php -build=light
+			[[ $(conf_read_exported php-tool-postfix) == "true" ]] && sudo stack -postfix
+			[[ $(conf_read_exported php-tool-redis) == "true" ]] && sudo stack -redis
+			[[ $(conf_read_exported php-tool-memcached) == "true" ]] && sudo stack -memcached
+		fi
+	fi
+	
+	if [[ $(conf_read_exported mysql) == "true" && $(conf_read_exported mysql-tool-pma) == "true" ]]; then
+		# Passwords are imported too, so we don't need to display passwords created during the installation process, because they are replaced.
+		sudo stack -mysql -block-password-display
+	elif [[ $(conf_read_exported mysql-tool) == "true" ]]; then
+			# Support for old configuration - REMOVE in the future!
+			sudo stack -mysql -block-password-display
+	elif [[ $(conf_read_exported mysql) == "true" ]]; then
+		sudo stack -mysql -build=light -block-password-display
+	elif [[ $(conf_read_exported mysql-client) == "true" ]]; then
+		sudo stack -mysql=client
+	fi
+
+	
+	if [[ $is_tar == "true" ]]; then
+		# Check for custom HTTP Headers
+		if [[ $(conf_read_exported header-custom) == "true" ]]; then
+			if tar -tvf $file --absolute-names | grep -oq "/opt/webinoly/templates/source/custom_header_http_webinoly.data"; then
+				tar -C / -xf $file /opt/webinoly/templates/source/custom_header_http_webinoly.data --absolute-names
+			fi
+			if tar -tvf $file --absolute-names | grep -oq "/opt/webinoly/templates/source/custom_header_https_webinoly.data"; then
+				tar -C / -xf $file /opt/webinoly/templates/source/custom_header_https_webinoly.data --absolute-names
+			fi
+			if tar -tvf $file --absolute-names | grep -oq "/opt/webinoly/templates/source/custom_header_html_webinoly.data"; then
+				tar -C / -xf $file /opt/webinoly/templates/source/custom_header_html_webinoly.data --absolute-names
+			fi
+			sudo webinoly -custom-headers=reload
+		fi
+		
+		# Conf stack files
+		if tar -tvf $file --absolute-names | grep -oq "/etc/nginx/.htpasswd"; then
+			tar -C / -xf $file /etc/nginx/.htpasswd --absolute-names
+			sudo nginx -t && sudo service nginx reload
+		fi
+		if tar -tvf $file --absolute-names | grep -oq "$HOME/.aws/credentials"; then
+			tar -C / -xf $file $HOME/.aws/credentials --absolute-names
+		fi
+		if [[ $(conf_read mysql) == "true" ]]; then
+			if tar -tvf $file --absolute-names | grep -oq "$MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly-login.cnf"; then
+				tar -C / -xf $file $MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly-login.cnf --absolute-names
+			fi
+			if tar -tvf $file --absolute-names | grep -oq "$MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly.cnf"; then
+				tar -C / -xf $file $MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly.cnf --absolute-names
+				sudo systemctl restart mysql
+			fi
+		fi
+	fi
+}
+
+
+export_server() {
+	[[ -z $filename ]] && local filename="webinoly_full_backup_$(date +%F)-$(date +%T)"
+	
+	if [[ -z $destination || $destination =~ ^(default|true)$ ]]; then
+		destination="$HOME"
+		sudo mkdir -p $destination
+	
+	# Must start with / and can not end with /
+	elif [[ ! -d $destination && $(echo "${destination}" | cut -c-1) == "/" && $(echo "${destination}" | rev | cut -c-1) != "/" ]]; then
+		sudo mkdir -p $destination
+	fi
+	if [[ ! -d $destination || $(echo "${destination}" | rev | cut -c-1) == "/" ]]; then
+		echo "${red}[ERROR] Please, enter a valid destination path!${end}"
+		exit 1
+	fi
+	
+	# Create Temporary Files
+	sudo cp /opt/webinoly/webinoly.conf /opt/webinoly/webinoly.conf.exported
+	
+	if [[ $(conf_read mysql) == "true" && -z $skip_db && $(check_mysql_connection localhost) == "true" ]]; then
+		sudo webinoly -backup=local -dbname=all -destination=/var/www -filename=webinoly_backup_dball > /dev/null
+	fi
+	
+	smtp_backup
+	
+	# Create TAR file
+	[[ -d /var/www/html ]] && local exclude="--exclude=/var/www/html" || local exclude=""
+	[[ -d /var/www/$ADMIN_TOOLS_SITE ]] && local exclude="$exclude --exclude=/var/www/$ADMIN_TOOLS_SITE"
+	[[ -f /etc/nginx/sites-available/$ADMIN_TOOLS_SITE ]] && local exclude="$exclude --exclude=/etc/nginx/sites-available/$ADMIN_TOOLS_SITE"
+	[[ -L /etc/nginx/sites-enabled/$ADMIN_TOOLS_SITE ]] && local exclude="$exclude --exclude=/etc/nginx/sites-enabled/$ADMIN_TOOLS_SITE"
+	[[ -f /etc/nginx/sites-available/default ]] && local exclude="$exclude --exclude=/etc/nginx/sites-available/default"
+	[[ -L /etc/nginx/sites-enabled/default ]] && local exclude="$exclude --exclude=/etc/nginx/sites-enabled/default"
+	
+	[[ -f /opt/webinoly/webinoly.conf.exported ]] && local include="/opt/webinoly/webinoly.conf.exported" || local include=""
+	[[ -d /etc/nginx/apps.d ]] && local include="$include /etc/nginx/apps.d"
+	[[ -d /etc/nginx/conf.d ]] && local include="$include /etc/nginx/conf.d"
+	[[ -d /etc/nginx/sites-available ]] && local include="$include /etc/nginx/sites-available"
+	[[ -d /etc/nginx/sites-enabled ]] && local include="$include /etc/nginx/sites-enabled"
+	[[ -d /var/www ]] && local include="$include /var/www"
+	[[ -d /etc/letsencrypt ]] && local include="$include /etc/letsencrypt"
+	[[ -f /etc/nginx/.htpasswd ]] && local include="$include /etc/nginx/.htpasswd"
+	[[ -f $HOME/.aws/credentials ]] && local include="$include $HOME/.aws/credentials"
+	[[ -f /opt/webinoly/templates/source/custom_header_http_webinoly.data ]] && local include="$include /opt/webinoly/templates/source/custom_header_http_webinoly.data"
+	[[ -f /opt/webinoly/templates/source/custom_header_https_webinoly.data ]] && local include="$include /opt/webinoly/templates/source/custom_header_https_webinoly.data"
+	[[ -f /opt/webinoly/templates/source/custom_header_html_webinoly.data ]] && local include="$include /opt/webinoly/templates/source/custom_header_html_webinoly.data"
+	[[ -f $MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly-login.cnf ]] && local include="$include $MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly.cnf"
+	[[ -f $MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly.cnf ]] && local include="$include $MYSQL_CONF_PATH/${MYSQL_CONF_PREF}-webinoly.cnf"
+	[[ -d /etc/nginx/certs ]] && local include="$include /etc/nginx/certs"
+	
+	if [[ $(conf_read exclude-other-filesystems) == "true" ]]; then
+		sudo tar $exclude --one-file-system -Pcf $destination/$filename $include
+		echo "${blu}${dim}Exclude-Other-Filesystems enabled!${end}"
+	else
+		sudo tar $exclude -Pcf $destination/$filename $include
+	fi
+	
+	# Remove Temporary Files
+	sudo rm -rf /opt/webinoly/webinoly.conf.exported
+	[[ $(conf_read mysql) == "true" && -z $skip_db ]] && sudo rm -rf /var/www/webinoly_backup_dball
+	[[ $(conf_read smtp) == "true" ]] && sudo rm -rf /var/www/webinoly_backup_smtp
+	
+	if [[ -s $destination/$filename ]]; then
+		echo "${gre}Webinoly Complete Server Backup exported successfully!${end}${dim} ($destination/$filename) ${end}"
+	else
+		[[ -f $destination/$filename ]] && sudo rm -rf $destination/$filename
+		echo "${red}[ERROR] Unexpected error occurred while trying to export your server files!${end}"
+		exit 1
+	fi
+}
+
+
+export_site() {
+	# Check for Multiple sites or DB's
+	if [[ $(echo "${export}" | cut -c-1) == "[" && $(echo "${export}" | rev | cut -c-1) == "]" ]]; then
+		if [[ -n $subfolder ]]; then
+			echo "${red}[ERROR] Subfolder option not allowed for multiple sites!${end}"
+			exit 1
+		else
+			local multi_export="true"
+			echo "${blu}Processing multiple sites...${end}"
+		fi
+	elif [[ ! -f /etc/nginx/sites-available/$export ]]; then
+		echo "${red}[ERROR] Please, enter a valid value for export site/server parameter!${end}"
+		exit 1
+	elif [[ -f /etc/nginx/sites-available/$export && -n $subfolder && ! -d /var/www/$export/htdocs$subfolder  ]]; then
+		echo "${red}[ERROR] Subfolder not found!${end}"
+		exit 1
+	fi
+	
+	[[ -n $subfolder ]] && local subn=$(echo $subfolder | sed "s/\//_/g")
+	[[ -z $filename && -z $multi_export ]] && local filename="webinoly_${export}${subn}_$(date +%F)-$(date +%T)"
+	[[ -z $filename && -n $multi_export ]] && local filename="webinoly_multiple_$(date +%F)-$(date +%T)"
+	
+	if [[ -z $destination || $destination =~ ^(default|true)$ ]]; then
+		destination="$HOME"
+		sudo mkdir -p $destination
+	
+	# Must start with / and can not end with /
+	elif [[ ! -d $destination && $(echo "${destination}" | cut -c-1) == "/" && $(echo "${destination}" | rev | cut -c-1) != "/" ]]; then
+		sudo mkdir -p $destination
+	fi
+	if [[ ! -d $destination || $(echo "${destination}" | rev | cut -c-1) == "/" ]]; then
+		echo "${red}[ERROR] Please, enter a valid destination path!${end}"
+		exit 1
+	fi
+	
+	# Processing sites to export!
+	local c=1
+	while [[ -n $(echo ${export:1:-1} | cut -d',' -f $c -s) || -z $multi_export ]]
+	do
+		[[ -z $multi_export ]] && local siteto=$export || local siteto=$(echo ${export:1:-1} | cut -d',' -f $c -s)
+		local c=$(($c+1))
+		
+		if [[ -n $multi_export && ! -f /etc/nginx/sites-available/$siteto ]]; then
+			echo "${red}[ERROR] Site not found! $siteto ${end}"
+			continue
+		elif [[ -n $multi_export ]]; then
+			echo "${blu}${dim}Added: $siteto ${end}"
+		fi
+		
+		[[ -s /etc/nginx/sites-available/$siteto ]] && local include="$include /etc/nginx/sites-available/$siteto"
+		[[ -L /etc/nginx/sites-enabled/$siteto ]] && local include="$include /etc/nginx/sites-enabled/$siteto"
+		[[ -s /etc/nginx/apps.d/.htpasswd-$siteto ]] && local include="$include /etc/nginx/apps.d/.htpasswd-$siteto"
+		[[ -z $subfolder && -d /var/www/$siteto ]] && local include="$include /var/www/$siteto"
+		[[ -n $subfolder && -d /var/www/$siteto/htdocs$subfolder ]] && local include="$include /var/www/$siteto/htdocs$subfolder"
+		
+		[[ $(is_proxy $siteto $subfolder) == "true" ]] && local rp_upstream="true" # Include upstreams for reverse proxy
+		
+		for app in /etc/nginx/apps.d/${siteto}${subn}*.conf
+		do
+			[[ -s $app ]] && local include="$include $app"
+		done
+
+		# Check if Custom Cache
+		if [[ -f /etc/nginx/conf.d/webinoly.conf ]]; then
+			if [[ -f /etc/nginx/apps.d/$siteto$subn-wpcache.conf || -f /etc/nginx/apps.d/$siteto$subn-phpcache.conf ]]; then
+				local custom_cache="$(grep -E "^fastcgi_cache_path \/run\/nginx-cache\/${siteto}[ _].*;$" /etc/nginx/conf.d/webinoly.conf)"
+			elif [[ -f /etc/nginx/apps.d/$siteto$subn-proxy.conf && -n $(grep -F "# WebinolyProxyCacheStart" /etc/nginx/apps.d/$siteto$subn-proxy.conf) ]]; then
+				local custom_cache="$(grep -E "^proxy_cache_path \/run\/nginx-cache\/${siteto}[ _].*;$" /etc/nginx/conf.d/webinoly.conf)"
+			fi
+			if [[ -n $custom_cache ]]; then
+				[[ ! -f /var/www/webinoly.conf_temp ]] && sudo touch /var/www/webinoly.conf_temp
+				echo "$custom_cache" >> /var/www/webinoly.conf_temp
+			fi
+		fi
+
+		# Include database backup for this site!
+		if [[ -z $skip_db ]]; then
+			if [[ $(is_wp $siteto $subfolder) == "true" ]]; then
+				wp_conf_retrieve $siteto false false $subfolder
+				if [[ $(conf_read mysql) == "true" && $wp_dbhost_host == "localhost" && $(is_wp_installed $siteto $subfolder) == "true" && -n $wp_dbname ]]; then
+					# We use dbnames instead of domains because is easier to include subfolders
+					if [[ -z $export_db_list ]]; then
+						local export_db_list="$wp_dbname"
+					else
+						local export_db_list="$export_db_list,$wp_dbname"
+					fi
+					echo "${blu}${dim}Database included: ${siteto}${subfolder} ${end}"
+				elif [[ $wp_dbhost_host == "localhost" ]]; then
+					echo "${red}${dim}Database not found or empty: ${siteto}${subfolder} ${end}"
+				elif [[ -n $wp_dbhost_host && $wp_dbhost_host != "localhost" ]]; then
+					echo "${red}${dim}External database not included: ${siteto}${subfolder} ${end}"
+				fi
+			fi
+			
+			# Check if site contains WP in subfolders
+			for sit in "/etc/nginx/apps.d/${siteto}$(echo $subfolder | sed "s/\//_/g")_"*-wpcommon.conf
+			do 
+				local suby="/$(echo $sit | cut -f 2- -d "_" -s | cut -f -1 -d "-" -s | sed "s/_/\//g")"
+				if [[ -n $suby && $(is_wp $siteto $suby) == "true" ]]; then
+					wp_conf_retrieve $siteto false false $suby
+					if [[ -n $suby && $(conf_read mysql) == "true" && $wp_dbhost_host == "localhost" && $(is_wp_installed $siteto $suby) == "true" && -n $wp_dbname ]]; then
+						if [[ -z $export_db_list ]]; then
+							local export_db_list="$wp_dbname"
+						else
+							local export_db_list="$export_db_list,$wp_dbname"
+						fi
+						echo "${blu}${dim}Database included: ${siteto}${suby} ${end}"
+					elif [[ -n $suby && $wp_dbhost_host == "localhost" ]]; then
+						echo "${red}${dim}Database not found or empty: ${siteto}${suby} ${end}"
+					elif [[ -n $suby && -n $wp_dbhost_host && $wp_dbhost_host != "localhost" ]]; then
+						echo "${red}${dim}External database not included: ${siteto}${suby} ${end}"
+					fi
+				fi
+				local suby=""
+			done
+		fi
+	
+		[[ -z $multi_export ]] && break
+	done
+	
+	# Create backup file!
+	if [[ $(conf_read mysql) == "true" && -z $skip_db && -n $include && -n $export_db_list ]]; then
+		local export_db_list="[${export_db_list}]"
+		sudo webinoly -backup=local -dbname=$export_db_list -destination=/var/www -filename=webinoly_backup_db > /dev/null
+		[[ -f /var/www/webinoly_backup_db ]] && local include="$include /var/www/webinoly_backup_db"
+	fi
+	[[ -f /var/www/webinoly.conf_temp ]] && local include="$include /var/www/webinoly.conf_temp"
+	[[ $rp_upstream == "true" && -f /etc/nginx/conf.d/upstream_proxy.conf ]] && local include="$include /etc/nginx/conf.d/upstream_proxy.conf"
+	
+	if [[ -n $include && $(conf_read exclude-other-filesystems) == "true" ]]; then
+		sudo tar --one-file-system -Pcf $destination/$filename $include
+		echo "${blu}${dim}Exclude-Other-Filesystems enabled!${end}"
+	elif [[ -n $include ]]; then
+		sudo tar -Pcf $destination/$filename $include
+	fi
+	
+	# Remove temporary files
+	sudo rm -rf /var/www/webinoly_backup_db
+	sudo rm -rf /var/www/webinoly.conf_temp
+	
+	if [[ -s $destination/$filename ]]; then
+		[[ -z $multi_export ]] && echo "${gre}Webinoly Site Backup${blu} $siteto ${gre}exported successfully!${end}${dim} ($destination/$filename) ${end}"
+		[[ -n $multi_export ]] && echo "${gre}Webinoly Site Backup for multiple sites exported successfully!${end}${dim} ($destination/$filename) ${end}"
+	else
+		[[ -f $destination/$filename ]] && sudo rm -rf $destination/$filename
+		echo "${red}[ERROR] Unexpected error occurred while trying to export your site!${end}"
+		exit 1
+	fi
+}
+
+
+import_site() {
+	if [[ $import =~ ^(stack|full)$ ]]; then
+		echo "${red}[ERROR] Site backup file found, stack or full options are not supported!${end}"
+		exit 1
+	elif ! [[ $import =~ ^(true|sites)$ ]]; then
+		echo "${red}[ERROR] Invalid value for import parameter!${end}"
+		exit 1
+	fi
+	
+	# List sites found!
+	local list_sites=$(tar -tvf $file --absolute-names | grep -Go "/etc/nginx/sites-available/.*" | sort -u)
+	if [[ -n $list_sites ]]; then
+		echo "${blu}Sites found:${dim}"
+		echo "$list_sites" | cut -d'/' -f 5 -s
+		echo "${end}"
+	else
+		echo "${red}[ERROR] No sites were found!${end}"
+		exit 1
+	fi
+	
+	local c=1
+	while [[ -n $(echo "$list_sites" | sed -n "${c}p" | cut -d'/' -f 5 -s) ]]
+	do
+		local domain=$(echo "$list_sites" | sed -n "${c}p" | cut -d'/' -f 5 -s)
+		local c=$(($c+1))
+		
+		if [[ -f /etc/nginx/sites-available/$domain && $overwrite != "on" ]]; then
+			echo "${red}[ERROR] Site you are trying to import already exists! ${dim}(${domain})${end}"
+			exit 1
+		elif [[ -f /etc/nginx/sites-available/$domain && $overwrite == "on" ]]; then
+			echo "${blu}Site${end} $domain ${blu}already exists... ${dim} Overwriting...${end}"
+		elif [[ ! -f /etc/nginx/sites-available/$domain && $overwrite == "on" ]]; then
+			# If site don't exist, it's not really overwriting, so it can break things that should be there in an existing site.
+			overwrite=""
+		fi
+	done
+	
+	sudo tar -Pxf $file
+
+	# Database
+	if [[ -s /var/www/webinoly_backup_db && $(conf_read mysql) == "true" && $(check_mysql_connection localhost) == "true" && -z $skip_db ]]; then
+		sudo webinoly -db-import -file=/var/www/webinoly_backup_db
+		sudo rm -rf /var/www/webinoly_backup_db
+		local db_create_users="true"
+	elif [[ -f /var/www/webinoly_backup_db && ( $(conf_read mysql) != "true" || $(check_mysql_connection localhost) != "true" ) && -z $skip_db ]]; then
+		echo "${red}[ERROR] Database backup found but can not be restored because MySQL/MariaDB is not installed!${end}"
+	
+	# REMOVE: Just for legacy support, folder with domain is not used anymore!
+	elif [[ -f /var/www/$domain/webinoly_backup_db && -z $skip_db ]]; then
+		echo "${red}[ERROR] Database backup found but can not be restored because is using an old and incompatible format, you need to create a new exported file!${end}"
+	fi	
+	
+	# Custom Cache settings
+	if [[ -f /var/www/webinoly.conf_temp ]]; then
+		if [[ ! -f /etc/nginx/conf.d/webinoly.conf ]]; then
+			sudo touch /etc/nginx/conf.d/webinoly.conf
+			sudo chmod 644 /etc/nginx/conf.d/webinoly.conf
+			sudo chown -R root:root /etc/nginx/conf.d/webinoly.conf
+		fi
+		sudo cat /var/www/webinoly.conf_temp >> /etc/nginx/conf.d/webinoly.conf
+		sudo rm -rf /var/www/webinoly.conf_temp
+	fi
+	
+	local c=1
+	while [[ -f /etc/nginx/sites-available/$(echo "$list_sites" | sed -n "${c}p" | cut -d'/' -f 5 -s) ]]
+	do
+		local domain=$(echo "$list_sites" | sed -n "${c}p" | cut -d'/' -f 5 -s)
+		local c=$(($c+1))
+	
+		# Remove old configurations
+		remove_nginx_default_server $domain
+		[[ $(is_ssl $domain) == "true" ]] && sudo site $domain -ssl=off -revoke=off > /dev/null 2>&1
+		
+		
+		if [[ $(conf_read php) != "true" && ( $(is_wp $domain) == "true" || $(is_php $domain) == "true" ) ]]; then
+			echo "${red}[WARNING] Your site${bol} $domain ${end}${red}may not work because PHP is not installed!${end}"
+		fi
+		
+		# Database recovery - create users because they are not imported
+		if [[ -n $db_create_users && $overwrite != "on" && $(is_wp $domain) == "true" ]]; then
+			wp_conf_retrieve $domain false false
+			if [[ $wp_dbhost_host == "localhost" && -n $wp_dbname && -n $wp_dbuser && -n $wp_dbpass && -n $($MYSQL_SHOW_COMMAND --user=admin "${mysql_params[@]}" | grep -ow $wp_dbname) ]]; then
+				echo "${blu}${dim}Restoring database for${end}${dim} $domain ${blu}${dim}site!${end}"
+				
+				# Check if user exists
+				if [[ -z $($MYSQL_COMMAND --connect-timeout=10 --user=admin -e "SELECT User FROM mysql.user;" "${mysql_params[@]}" | grep -ow $wp_dbuser) ]]; then
+					$MYSQL_COMMAND --connect-timeout=10 --user=admin "${mysql_params[@]}" <<_EOF_
+CREATE USER '${wp_dbuser}'@'localhost' IDENTIFIED BY '${wp_dbpass}';
+GRANT $(db_user_role) on ${wp_dbname}.* to '${wp_dbuser}'@'localhost';
+FLUSH PRIVILEGES;
+_EOF_
+				elif [[ $(check_mysql_connection localhost $wp_dbuser $wp_dbpass $wp_dbname $mysql_param) != "true" ]]; then
+					echo "${red}${dim}[ERROR] Database cannot be restored, seems like a user with the same name already exists.${end}"
+				else
+					echo "${blu}${dim}DB user already exists and a successful connection can be established, so we will use it.${end}"
+				fi
+			fi
+		fi
+		
+		# Check if site contains WP in subfolders and include these db's.
+		if [[ -n $db_create_users && $overwrite != "on" ]]; then
+			for sit in "/etc/nginx/apps.d/${domain}_"*-wpcommon.conf
+			do 
+				local suby="/$(echo $sit | cut -f 2- -d "_" -s | cut -f -1 -d "-" -s | sed "s/_/\//g")"
+				if [[ -n $suby && -f /var/www/$domain/htdocs$suby/wp-config.php ]]; then
+					wp_conf_retrieve $domain false false $suby
+					if [[ $wp_dbhost_host == "localhost" && -n $wp_dbname && -n $wp_dbuser && -n $wp_dbpass && -n $($MYSQL_SHOW_COMMAND --user=admin "${mysql_params[@]}" | grep -ow $wp_dbname) ]]; then
+						echo "${blu}${dim}Restoring database for${end}${dim} ${domain}${suby} ${blu}${dim}site!${end}"
+						
+						# Check if user exists
+						if [[ -z $($MYSQL_COMMAND --connect-timeout=10 --user=admin -e "SELECT User FROM mysql.user;" "${mysql_params[@]}" | grep -ow $wp_dbuser) ]]; then
+							$MYSQL_COMMAND --connect-timeout=10 --user=admin "${mysql_params[@]}" <<_EOF_
+CREATE USER '${wp_dbuser}'@'localhost' IDENTIFIED BY '${wp_dbpass}';
+GRANT $(db_user_role) on ${wp_dbname}.* to '${wp_dbuser}'@'localhost';
+FLUSH PRIVILEGES;
+_EOF_
+						elif [[ $(check_mysql_connection localhost $wp_dbuser $wp_dbpass $wp_dbname $mysql_param) != "true" ]]; then
+							echo "${red}${dim}[ERROR] Database cannot be restored, seems like a user with the same name already exists.${end}"
+						else
+							echo "${blu}${dim}DB user already exists and a successful connection can be established, so we will use it.${end}"
+						fi
+					fi
+				fi
+				local suby=""
+			done
+		fi
+		
+		echo "${gre}Webinoly Site Backup${blu} $domain ${gre}imported successfully!${end}"
+	done
+}
+
+
+import_server() {
+	[[ -z $file || $file == "true" ]] && read -p "${blu}Path file to import: ${end}" file
+	if [[ ! -f $file || ( -f $file && ( ! -s $file || -z $(cat -v $file | grep -m 1 '[^[:space:]]'))) ]]; then
+		echo "${red}[ERROR] File not found or empty!${end}"
+		exit 1
+	elif ! [[ $import =~ ^(true|sites|stack|full)$ ]]; then
+		echo "${red}[ERROR] Invalid value for import parameter!${end}"
+		exit 1
+	elif [[ -n $(sudo file $file | grep -Fo " tar archive ") ]]; then
+		is_tar="true"
+	fi
+	
+	
+	if [[ $is_tar != "true" ]]; then
+		if [[ -z $(grep -w "^app-version:.*" $file | cut -f 2 -d ':') ]]; then
+			echo "${red}[ERROR] Invalid File, Webinoly configuration not found!${end}"
+			exit 1
+		elif ! [[ $import =~ ^(true|stack)$ ]]; then
+			echo "${red}[ERROR] Invalid value for import parameter!${end}"
+			exit 1
+		fi
+		
+		[[ $import == "true" ]] && import="stack"
+		echo "${gre}${dim}Webinoly single file Stack Configuration found...${end}"
+		
+	elif ! tar -tvf $file --absolute-names | grep -o "/opt/webinoly/webinoly.conf.exported"; then
+		if tar -tvf $file --absolute-names | grep -Goq "/etc/nginx/sites-available/.*"; then
+			import_site
+			return
+		else
+			echo "${red}[ERROR] Invalid File, Webinoly configuration not found!${end}"
+			exit 1
+		fi
+	fi
+
+	if [[ $import =~ ^(true|stack|full)$ ]]; then
+		[[ $is_tar == "true" ]] &&  tar -C / -xf $file /opt/webinoly/webinoly.conf.exported --absolute-names || sudo cp $file /opt/webinoly/webinoly.conf.exported
+		[[ $is_tar == "true" && $import == "true" ]] && import="full"
+		
+		check_exported_conf
+		echo "${gre}Webinoly Stack Server was built using your imported configuration!${end}"
+	fi
+
+	if [[ $import =~ ^(true|sites|full)$ ]]; then
+		sudo tar -Pxf $file
+		
+		# Check imported configuration file to prevent issues
+		[[ ! -f /opt/webinoly/webinoly.conf.exported ]] && echo "${red}[ERROR] Exported Configuration file not found!${end}"
+		
+		if [[ $(conf_read_exported php) == "true" && $(conf_read php) != "true" ]]; then
+			echo "${red}[ERROR] PHP is not installed, some exported files may not work properly!${end}"
+		fi
+		if [[ $(conf_read_exported server-version) != $(conf_read server-version) ]]; then
+			echo "${red}${dim}[WARNING] Imported file was created using an older configuration, the new stack built can differ!${end}"
+		fi
+		
+		if [[ -s /var/www/webinoly_backup_dball && $(conf_read mysql) == "true" && -z $skip_db ]]; then
+			sudo webinoly -db-import -file=/var/www/webinoly_backup_dball
+			[[ -n $(conf_read_exported mysql-root) ]] && conf_write mysql-root $(conf_read_exported mysql-root) || conf_delete mysql-root -commented
+			[[ -n $(conf_read_exported mysql-admin) ]] && conf_write mysql-admin $(conf_read_exported mysql-admin) || conf_delete mysql-admin -commented
+			sudo rm -rf /var/www/webinoly_backup_dball
+			sudo webinoly -server-reset=mysql
+		elif [[ -s /var/www/webinoly_backup_dball && $(conf_read mysql) != "true" && -z $skip_db ]]; then
+			echo "${red}[ERROR] Database backup found but can not be restored because MySQL/MariaDB is not installed!${end}"
+		fi
+		
+		[[ $import != "sites" ]] && echo "${gre}Webinoly Full Server Backup imported successfully!${end}" || echo "${gre}Webinoly Backup imported successfully!${end}"
+	fi
+	
+	# SMTP Configuration - should be here after sites are extracted and only if sites are imported.
+	[[ $import == "full" && $(conf_read_exported smtp) == "true" && -s /var/www/webinoly_backup_smtp ]] && smtp_backup_recovery
+	
+	# Default-Site and Tools Site Settings! - should be here after sites are extracted and only if sites are imported.
+	if [[ $import =~ ^(sites|stack|full)$ ]]; then
+		if [[ -f /etc/nginx/sites-available/$(conf_read_exported default-site) ]]; then
+			remove_nginx_default_server $(conf_read_exported default-site)
+			sudo webinoly -default-site=$(conf_read_exported default-site)
+		fi
+		
+		[[ -f /etc/nginx/sites-available/$(conf_read_exported tools-site) ]] && sudo webinoly -tools-site=$(conf_read_exported tools-site)
+	fi
+	
+	sudo mv /opt/webinoly/webinoly.conf.exported /opt/webinoly/webinoly.conf.imported_$(date +%F)-$(date +%T)
+}
+
+
+bkp_wizard() {
+	echo "${gre}"
+	echo " ***********************************"
+	echo " ************  Backups  ************"
+	echo " ***********************************"
+	echo "${blu}"
+	echo " 1 - Add AWS S3 Credentials"
+	echo " 2 - AWS S3 directory backup"
+	echo " 3 - WordPress Database local backup"
+	echo " 4 - Restore backup from S3"
+	echo " 5 - Run S3 backup"
+	echo " 6 - Delete profile"
+	echo " 7 - Profile info"
+	echo " 8 - List profiles"
+	echo " 9 - Export site"
+	echo " 10 - Export server"
+	echo " 11 - Import server/site"
+	echo "${gre}"
+	read -p "What do you want to do? ${end}" wzd
+	echo ""
+	
+	if [[ $wzd == 1 ]]; then
+		webinoly -aws-s3-credentials
+	elif [[ $wzd == 2 ]]; then
+		bkp_s3_profile
+	elif [[ $wzd == 3 ]]; then
+		bkp_local_db
+	elif [[ $wzd == 4 ]]; then
+		restore="true"
+		bkp_s3_profile
+	elif [[ $wzd == 5 ]]; then
+		run="true"
+		bkp_s3_profile
+	elif [[ $wzd == 6 ]]; then
+		delete="true"
+		bkp_s3_profile
+	elif [[ $wzd == 7 ]]; then
+		info="true"
+		bkp_s3_profile
+	elif [[ $wzd == 8 ]]; then
+		bkp_s3_list
+	elif [[ $wzd == 9 ]]; then
+		read -p "${blu}Site to export (domain): ${end}" site
+		is_url $site -split	
+		if [[ -n $url_host && -n $url_path ]]; then
+			sudo webinoly -backup=local -export=$url_host -subfolder=$url_path
+		else # if not a URL, let it fail in the export function!
+			sudo webinoly -backup=local -export=$site
+		fi
+	elif [[ $wzd == 10 ]]; then
+		export_server
+	elif [[ $wzd == 11 ]]; then
+		import_server
+	else
+		echo "${red}[ERROR] Please, enter a valid option!${end}"
+		exit 1
+	fi
+}

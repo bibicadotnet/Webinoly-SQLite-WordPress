@@ -1,0 +1,296 @@
+#!/bin/bash
+
+# This is a library for Site Manager Plugin
+# Functions for SSL On/Off
+
+
+ssl_nginx() {
+	sudo sed -i '/listen 80/c \	listen 443 ssl;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/listen \[::\]:80/c \	listen [::]:443 ssl;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/listen \[::\]:443/a \	listen 443 quic;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/listen \[::\]:443/a \	listen [::]:443 quic;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/server_name /r /opt/webinoly/templates/template-site-ssl' /etc/nginx/sites-available/$domain
+	
+	# Headers
+	sudo sed -i '/header.conf;/c \	include common/headers.conf;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/headers-http.conf/a \	include common/headers-https.conf;' /etc/nginx/sites-available/$domain # In case of Force-Redirect!
+	for pxy in "/etc/nginx/apps.d/${domain}"*-proxy.conf
+	do
+		[[ -f $pxy ]] && sudo sed -i '/headers-http.conf;/a \		include common/headers-https.conf;' $pxy
+	done
+	
+	[[ -n $add_to_wildcard ]] && cert=$add_to_wildcard || cert=$domain
+	sudo sed -i "/WebinolySSLstart/,/WebinolySSLend/{s/domain.com/$cert/}" /etc/nginx/sites-available/$domain
+	
+	# Custom SSL files
+	if [[ -n $ssl_crt && -n $ssl_key ]]; then
+		sudo sed -i '/WebinolySSLstart/a \	# WebinolySSLCustomCert' /etc/nginx/sites-available/$domain
+		sudo sed -i "/fullchain.pem/c \	ssl_certificate $ssl_crt;" /etc/nginx/sites-available/$domain
+		sudo sed -i "/privkey.pem/c \	ssl_certificate_key $ssl_key;" /etc/nginx/sites-available/$domain
+		
+		sudo chmod 777 $ssl_crt
+		sudo chmod 777 $ssl_key
+		sudo chmod 755 $(dirname -- $ssl_crt)
+		sudo chmod 755 $(dirname -- $ssl_key)
+		sudo chown -R root:root $(dirname -- $ssl_crt)
+		
+		# Not duplicate: Custom cert function does not run the same way as LE requests.
+		# For some unknown reason this condition doesn't work in oneline as we usually do!
+		if [[ $(is_force_redirect $domain) == "www" ]]; then
+			wp_db_update $domain "https://www.${domain}"
+		else
+			wp_db_update $domain "https://${domain}"
+		fi
+		
+		if [[ -n $ssl_ocsp && -f $ssl_ocsp ]]; then
+			sudo sed -i "/ssl_trusted_certificate/c \	ssl_trusted_certificate $ssl_ocsp;" /etc/nginx/sites-available/$domain
+			sudo chmod 777 $ssl_ocsp
+			sudo chmod 755 $(dirname -- $ssl_ocsp)
+		else
+			sudo sed -i '/WebinolySSLstart/,/WebinolySSLend/{/ssl_stapling/d}' /etc/nginx/sites-available/$domain
+			sudo sed -i '/WebinolySSLstart/,/WebinolySSLend/{/ssl_trusted_certificate/d}' /etc/nginx/sites-available/$domain
+		fi
+	fi
+
+	# HTTP to HTTPS Redirection
+	[[ $subdomain == "true" ]] && local sername="server_name $domain;" || local sername="server_name $domain www.$domain;"
+	[[ -n $wildcard ]] && sername="server_name $domain *.$domain;"
+	sudo sed -i '1r /opt/webinoly/templates/template-site-sslredirect' /etc/nginx/sites-available/$domain
+	sudo sed -i "/#server_name;/c \	$sername" /etc/nginx/sites-available/$domain
+
+	# In case this domain is used as tools-site or default-site
+	if [[ $(conf_read default-site) == $domain ]]; then
+		sudo webinoly -default-site=default > /dev/null 2>&1
+		sudo webinoly -default-site=$domain > /dev/null 2>&1
+		echo "${gre}${dim}Default Site updated with SSL!${end}"
+	fi
+	if [[ $(conf_read tools-site) == $domain ]]; then
+		sudo webinoly -tools-site=default > /dev/null 2>&1
+		sudo webinoly -tools-site=$domain > /dev/null 2>&1
+		echo "${gre}${dim}Tools Site updated with SSL!${end}"
+	fi
+}
+
+
+site_ssl_on() {
+	local cermail=$(conf_read mail)
+	local path=$domain
+	
+	# Some validations to prevent errors when creating certs.
+	check_for_nginx_tool_ssl -ask
+	if [[ -n $root && -f /etc/nginx/sites-available/$root ]]; then
+		path=$root
+	elif [[ -n $root && ! -f /etc/nginx/sites-available/$root ]]; then
+		echo "${red}[ERROR] Root path domain is not a valid domain or is not found/hosted in this server!${end}"
+		exit 1
+	fi
+	
+	if [[ -n $manual && $manual != "http" && $manual != "dns" ]]; then
+		echo "${red}[ERROR] Invalid value for manual option!${end}"
+		exit 1
+	elif [[ ! -d /var/www/$path/htdocs && -z $root_path && -z $manual ]]; then
+		echo "${red}[ERROR] Seems like you are trying to request an SSL Certificate for a Parked/Mapped Domain."
+		echo "Please, use the '-root=domain.com' parameter to specify the main domain."
+		echo ""
+		echo "If your site is using the Reverse Proxy configuration, please use the '-root-path=/opt/app' option.${end}"
+		exit 1
+	elif [[ -n $root_path && ! -d $root_path ]]; then
+		echo "${red}[ERROR] Invalid root path!${end}"
+		exit 1
+	elif [[ ! -f /etc/letsencrypt/live/$domain/fullchain.pem && $ssl == "force-renewal" ]]; then
+		echo "${red}[ERROR] Cert you're trying to renew not found!${end}"
+		exit 1
+	elif [[ -n $test_cert ]]; then
+		echo "${dim}[INFO] This is TEST Cert request! (Don't use it on a real/final site)${end}"
+	fi
+	
+
+	echo "${gre}"
+	echo "*************************************************************************************************"
+	echo "**  Please, be careful with the number of intents or certificates you try to get.              **"
+	echo "**  Let’s Encrypt provides rate limits to ensure fair usage by as many people as possible.     **"
+	echo "**                                                                                             **"
+	echo "**  If you are getting errors or having issues when trying to get a new certificate            **"
+	echo "**  read about the Let's Encrypt rate limit - https://letsencrypt.org/docs/rate-limits/        **"
+	echo "*************************************************************************************************"
+	echo "${end}"
+	[[ $subdomain == "false" ]] && echo "${blu}Please, be sure that${end} $domain ${blu}and${end} www.$domain ${blu}are both currently pointing (DNS) to this server. ${end}"
+	[[ $subdomain == "true" ]] && echo "${blu}Please, be sure that the${end} $domain ${blu}subdomain is currently pointing (DNS) to this server. ${end}"
+	
+	# We need an email to notify each renew intent (cron)
+	while [[ -z $cermail ]]
+	do
+		echo "${blu}"
+		read -p "Please, enter an email to register your new certificate: ${end}" cermail
+		email_update $cermail
+		[[ $(conf_read mail) != $cermail ]] && cermail=""
+	done
+	
+	# Create new certificate
+	local param="--email $cermail --no-eff-email --agree-tos --staple-ocsp"
+	[[ $must_staple == "on" ]] && param="$param --must-staple"
+	[[ -n $test_cert ]] && param="$param --test-cert"
+	[[ $ssl == "force-renewal" ]] && param="$param --force-renewal"
+	[[ $subdomain == "true" ]] && local domset="-d $domain" || local domset="-d $domain -d www.$domain"
+	
+	# Must-Staple issue: https://trac.nginx.org/nginx/ticket/812
+	# Also: https://blog.apnic.net/2019/01/15/is-the-web-ready-for-ocsp-must-staple/
+	
+	if [[ -n $wildcard ]]; then
+		local domset="-d $domain -d *.$domain"
+		local manual="dns"
+	fi
+	
+	# Custom Root-Path mode for local Reverse Proxy sites
+	if [[ ( ! -f /etc/letsencrypt/live/$domain/fullchain.pem || $ssl == "force-renewal" ) && -n $root_path ]]; then
+		conf_write temp-path $root_path
+		sudo certbot certonly --manual --preferred-challenges=http --manual-auth-hook /opt/webinoly/lib/ex-ssl-authentication --manual-cleanup-hook /opt/webinoly/lib/ex-ssl-cleanup $domset $param
+		conf_delete temp-path
+	
+	# Normal and manual certs
+	elif [[ ! -f /etc/letsencrypt/live/$domain/fullchain.pem || $ssl == "force-renewal" ]]; then
+		if [[ -n $manual ]]; then
+			sudo certbot certonly --manual --preferred-challenges=$manual $domset $param
+			echo "${dim}[INFO] Be aware that manual Certs are NOT automatically renewed! (Read the docs for manual renewing process)${end}"
+		else
+			sudo certbot certonly --webroot -w /var/www/$path/htdocs/ $domset $param
+		fi
+	
+	# Existing cert
+	elif [[ -f /etc/letsencrypt/live/$domain/fullchain.pem ]]; then
+		echo "${dim}[INFO] Cert NOT requested because already exist!${end}"
+		[[ -z $test_cert && $(is_ssl_staging $domain) == "true" ]] && echo "${red}[WARNING] Cert found is a staging cert for testing.${end}"
+		[[ -n $test_cert && $(is_ssl_staging $domain) != "true" ]] && echo "${red}[WARNING] Test-Cert was requested and cert found is a real/normal cert.${end}"
+	fi
+	
+	
+	# SSL Nginx Conf
+	if [[ -f /etc/letsencrypt/live/$domain/fullchain.pem && $ssl != "force-renewal" ]]; then
+		ssl_nginx
+
+		# Auto-Renew Certificate
+		if [[ ! -f /var/spool/cron/crontabs/root ]]; then
+			sudo touch /var/spool/cron/crontabs/root
+			sudo chmod 600 /var/spool/cron/crontabs/root
+			sudo chown root:crontab /var/spool/cron/crontabs/root
+		fi
+		
+		local cronmail=$( sudo grep -F "MAILTO=" /var/spool/cron/crontabs/root )
+		local cronrene=$( sudo grep -F "certbot renew" /var/spool/cron/crontabs/root )
+		[[ -z $cronmail && -n $cermail && -z $cronrene ]] && echo "MAILTO=${cermail}" | sudo tee -a /var/spool/cron/crontabs/root > /dev/null
+		[[ -z $cronrene ]] && echo '15 3 * * 7 certbot renew' | sudo tee -a /var/spool/cron/crontabs/root > /dev/null
+
+		# We use this script instead of the post-hook in crontab to restart Nginx
+		# Most of the times certs are renewed via the certbot systemctl timer - sudo systemctl list-timers
+		# The cronjob renew is just a double-check, so this solution is better because is covering both scenarios
+		if [[ ! -f /etc/letsencrypt/renewal-hooks/deploy/99-webinoly-deploy ]]; then
+			cp /opt/webinoly/templates/general/certbot-deploy-hook /etc/letsencrypt/renewal-hooks/deploy/99-webinoly-deploy
+			sudo chmod -f 744 /etc/letsencrypt/renewal-hooks/deploy/99-webinoly-deploy
+		fi
+
+		# For some unknown reason this condition doesn't work in oneline as we usually do!
+		if [[ $(is_force_redirect $domain) == "www" ]]; then
+			wp_db_update $domain "https://www.${domain}"
+		else
+			wp_db_update $domain "https://${domain}"
+		fi
+		
+		echo "${gre}SSL have been successfully enabled for your site${blu} $domain${end}"
+	elif [[ -f /etc/letsencrypt/live/$domain/fullchain.pem && $ssl == "force-renewal" ]]; then
+		echo "${gre}SSL Cert${blu} $domain ${gre}has been Forced to Renew!${end}"
+	elif [[ ! -f /etc/letsencrypt/live/$domain/fullchain.pem ]]; then
+		echo "${red}"
+		echo "[ERROR] Unable to create the new certificate!"
+		echo "${end}"
+		exit 1
+	fi
+	[[ -n $test_cert || $(is_ssl_staging $domain) == "true" ]] && echo "${red}[WARNING] Let's Encrypt Staging Environment is enabled, this SSL Cert is just for testing purpose and should not be used in production enviroments.${end}"
+}
+
+
+ssl_revoke() {
+	[[ $(is_ssl_staging $domain) == "true" ]] && local param="--test-cert" || local param=""
+	sudo certbot revoke --cert-path /etc/letsencrypt/live/$domain/cert.pem --delete-after-revoke --non-interactive $param
+	
+	if [[ ! -f /etc/letsencrypt/live/$domain/cert.pem ]]; then
+		echo "${gre}"
+		echo "SSL Cert for your site${blu} $domain ${gre}has been completely removed and revoked!${end}"
+	else
+		echo "${red}[ERROR] Cert cannot be revoked!${dim} (A common cause is that expired certs cannot be revoked)${end}"
+		
+		if [[ ${revoke,,} == "force" ]]; then
+			ans="Y"
+		else
+			echo "${blu}Do you want to delete this cert [y/N]? ${end}"
+			while read -r -n 1 -s ans; do
+				answer=${ans:-n}
+				[[ $ans = [YyNn] ]] && break
+			done
+		fi
+		[[ $ans == [Yy] ]] && sudo certbot delete -n --cert-name $domain
+	
+		if [[ ! -f /etc/letsencrypt/live/$domain/cert.pem ]]; then
+			echo "${gre}"
+			echo "SSL Cert for your site${blu} $domain ${gre}has been successfully removed!${end}"
+		else
+			echo "${red}[ERROR] Cert cannot be removed!${end}"
+			exit 1
+		fi
+	fi
+}
+
+
+site_ssl_off() {
+	# Don't ask if SSL is Custom
+	[[ $(is_ssl_le $domain) != "true" ]] && revoke="off"
+	
+	sudo sed -i '/listen 443 .*quic.*/d' /etc/nginx/sites-available/$domain
+	sudo sed -i '/listen \[::\]:443 .*quic.*/d' /etc/nginx/sites-available/$domain
+	sudo sed -i '/listen 443/c \	listen 80;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/listen \[::\]:443/c \	listen [::]:80;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/WebinolySSLstart/,/WebinolySSLend/{/.*/d}' /etc/nginx/sites-available/$domain
+	sudo sed -i '/WebinolySSLredirectStart/,/WebinolySSLredirectEnd/{/.*/d}' /etc/nginx/sites-available/$domain
+	
+	# Headers
+	sudo sed -i '/headers.conf;/c \	include common/header.conf;' /etc/nginx/sites-available/$domain
+	sudo sed -i '/WebinolyWWWredirectStart/,/WebinolyWWWredirectEnd/{/headers-https.conf;/d}' /etc/nginx/sites-available/$domain # In case of Force-Redirect
+	for pxy in "/etc/nginx/apps.d/${domain}"*-proxy.conf
+	do
+		[[ -f $pxy ]] && sudo sed -i '/CacheStaticFiles/,/expires max;/{/headers-https.conf;/d}' $pxy
+	done
+	
+	# In case this domain is used as tools-site or default-site
+	if [[ $(conf_read default-site) == $domain ]]; then
+		sudo webinoly -default-site=default > /dev/null 2>&1
+		sudo webinoly -default-site=$domain > /dev/null 2>&1
+		echo "${gre}${dim}Default Site updated with SSL!${end}"
+	fi
+	if [[ $(conf_read tools-site) == $domain ]]; then
+		sudo webinoly -tools-site=default > /dev/null 2>&1
+		sudo webinoly -tools-site=$domain > /dev/null 2>&1
+		echo "${gre}${dim}Tools Site updated with SSL!${end}"
+	fi
+	
+	[[ -z $no_db_update && $(is_force_redirect $domain) != "www" ]] && wp_db_update $domain "http://${domain}"
+	[[ -z $no_db_update && $(is_force_redirect $domain) == "www" ]] && wp_db_update $domain "http://www.${domain}"
+	
+	# Check if exist to not try to revoke a cert that don't exist, for example a site with a cert added to a wildcard! (-add-to-wildcard)
+	if [[ -f /etc/letsencrypt/renewal/${domain}.conf ]]; then
+		if [[ -n $revoke && $revoke =~ ^(on|off|force)$ ]]; then
+			[[ $revoke =~ ^(on|force)$ ]] && answer="Y" || answer="N"
+		else
+			echo "${blu}Select 'Y' to revoke and delete all the certificate files."
+			echo "Select 'N' if you only want to deactivate this certificate momentary and you will activate it later again."
+			echo "${gre}"
+			echo "Do you want to delete and revoke this certificate [y/N]? "
+			while read -r -n 1 -s answer; do
+			  answer=${answer:-n}
+			  [[ $answer = [YyNn] ]] && break
+			done
+			echo "${end}"
+		fi
+	fi
+	echo "${gre}SSL has been successfully disabled for your site${blu} $domain${end}"
+	[[ $answer == [Yy] ]] && ssl_revoke
+	echo "" # To exit successfully, other way the || in the main function is triggered!
+}

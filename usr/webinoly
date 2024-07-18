@@ -1,0 +1,311 @@
+#!/bin/bash
+
+# Webinoly Server Manager Plugin
+# Syntax: webinoly <option> <argument>
+# Options: -update, -server-reset, -verify, -dbpass, -tools-port, -login-www-data, -cache-valid, -uninstall, -info, -external-sources-update, -clear-cache, -version, -blockip, -dynvar, -default-site, -tools-site, -mysql-password, -smtp, -backup, -aws-s3-credentials, -db-import, -send-to-s3, -custom-headers, -skip-cache, -skip-cookie-cache, -query-string-cache, -query-string-never-cache, -email, -export, -import, -mysql-public-access
+# Arguments: -raw, -profile, -list, -bucket, -source, -delete, -run, -restore, -wp, -destination, -date, -s3-european-buckets, info, -file, -add-db-pre, -no-recovery, -recalculate, -dbname, -skip-db, -filename, -overwrite, -value, -bind
+
+source /opt/webinoly/lib/webin
+source /opt/webinoly/lib/datadog
+source /opt/webinoly/lib/verify
+source /opt/webinoly/lib/bkp
+check_for_parameters $@
+api-events_update wys
+
+
+# Only these commands are supported with subfolders
+if [[ -n $subfolder && -z $clear_cache && -z $backup ]]; then
+	echo "${red}[ERROR] Subfolder option not supported!${end}"
+	exit 1
+fi
+
+
+if [[ -n $update ]]; then
+	api-events_update wy1
+	webinoly_update
+	nginx_not="true" # Nginx-Reload not-needed.
+	ads_block="true" # Don't show ads
+	
+	
+elif [[ -n $server_reset ]]; then
+	api-events_update wy2
+	if [[ $server_reset == true ]]; then
+		server_reset="all"
+	elif ! [[ $server_reset =~ ^(all|os|nginx|php|mysql|permissions)$ ]]; then
+		echo "${red}[ERROR] Please, enter a valid option to update/reset your server configuration!${end}"
+		exit 1
+	fi
+	server_reset
+	nginx_not="true" # Nginx-Reload not-needed.
+	
+	
+elif [[ -n $verify ]]; then
+	webinoly_verify
+	[[ $? != 0 ]] && exit 1
+	nginx_not="true" # Nginx-Reload not-needed.
+	[[ $verify == "critical" ]] && ads_block="true" # Don't show ads
+	
+	
+elif [[ -n $dbpass ]]; then
+	show_db_data
+	nginx_not="true" # Nginx-Reload not-needed.
+	
+	
+elif [[ -n $tools_port ]]; then
+	change_tools_port
+
+
+elif [[ -n $tools_site ]]; then
+	check_for_nginx -ask
+	set_tools_site
+
+	
+elif [[ -n $login_www_data ]]; then
+	check_for_nginx -ask
+	www_data_sftp_access
+	nginx_not="true" # Nginx-Reload not-needed.
+	
+	
+elif [[ -n $cache_valid ]]; then
+	config_fastcgi_cache
+
+	
+elif [[ -n $uninstall ]]; then
+	api-events_update wy4
+	webinoly_uninstall
+	nginx_not="true" # Nginx-Reload not-needed.
+	ads_block="true" # Don't show ads
+	
+	
+elif [[ -n $external_sources_update ]]; then
+	external_sources_update
+	nginx_not="true" # Nginx-Reload not-needed.
+	
+	
+elif [[ -n $clear_cache ]]; then
+	api-events_update wy3
+	[[ $clear_cache == true ]] && clear_cache="all"
+	if ! [[ $clear_cache =~ ^(redis|memcache|memcached|opcache|fastcgi|all)$ || -f /etc/nginx/sites-available/$clear_cache ]]; then
+		echo "${red}[ERROR] Please, enter a valid option!${end}"
+		exit 1
+	fi
+	clear_caches
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $timezone ]]; then
+	if [[ $timezone == true ]]; then
+		echo "${blu}${bol}"
+		echo "Please, enter a valid Timezone for Ubuntu and PHP. ${end}"
+		echo "${blu}${dim}https://www.php.net/manual/en/timezones.php ${end}"
+		echo ""
+		read -p "${blu}Timezone: ${end}" timezone
+		echo ""
+	fi
+	
+	# Check first here to not overwrite a valid good value with a wrong value.
+	if [[ -n $timezone ]] && grep -Fxq $timezone /opt/webinoly/lib/timezone.dat; then
+		conf_write timezone $timezone
+		set_timezone
+	else
+		echo "${red}Timezone not found or not valid!${end}"
+		exit 1
+	fi
+	nginx_not="true" # Nginx-Reload not-needed.
+	
+
+elif [[ -n $version || -n $v || -n $V ]]; then
+	[[ -z $(conf_read server-version) ]] && sver="Not installed!" || sver=$(conf_read server-version)
+	
+	echo ""
+	echo "${blu}Webinoly version:${end} $app_version"
+	echo "${blu}Current stack version:${end} $sver"
+	[[ $sver != $svr_version ]] && echo "${blu}Available stack version:${end} $svr_version"
+	echo "${end}"
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $blockip ]]; then
+	check_for_nginx -ask
+	nginx_blockip
+
+
+elif [[ -n $dynvar ]]; then
+	if [[ -n $dynvar && $dynvar =~ ^[A-Za-z\-]+$ ]]; then
+		[[ -z $value ]] && read -p "${blu}Enter a value for '${dynvar}': ${end}" value
+		if [[ -n $value ]]; then
+			conf_write $dynvar "$value"
+			echo "${gre}Configuration successfully updated! ${dim}(${dynvar}:$(conf_read $dynvar))${end}" # Retrive the value to really be sure!
+		else
+			echo "${red}[ERROR] Please, enter a valid value!${end}"
+			exit 1
+		fi
+	else
+		echo "${red}[ERROR] Please, enter a valid variable name!${end}"
+		exit 1
+	fi
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $default_site ]]; then
+	check_for_nginx -ask
+	set_default_nginx_response
+	
+	
+elif [[ -n $mysql_password ]]; then
+	if [[ $(conf_read mysql) != "true" ]]; then
+		echo "${red}[ERROR] Seems like MySQL/MariaDB is not installed!${end}"
+		exit 1
+	elif [[ $(check_mysql_connection localhost) != "true" ]]; then
+		exit 1
+	fi
+	mysql_change_password
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $smtp && -n $purge ]]; then
+	check_for_php_tool_postfix
+	if [[ $(conf_read smtp) != "true" ]]; then
+		echo "${red}[ERROR] SMTP configuration not found!${end}"
+		exit 1
+	fi
+	
+	sudo cat /opt/webinoly/templates/source/main.cf >| /etc/postfix/main.cf
+	sudo sed -i '/mydestination =/c \mydestination = localhost' /etc/postfix/main.cf
+	rm -rf /etc/postfix/sasl_passwd.db
+	rm -rf /etc/postfix/sasl_passwd
+	rm -rf /etc/mailname
+	conf_write smtp purged
+	sudo systemctl restart postfix
+	echo "${gre}SMTP configuration has been successfully removed!${end}"
+elif [[ -n $smtp ]]; then
+	check_for_php_tool_postfix -ask
+	[[ $(conf_read smtp) == "true" ]] && echo "${gre}SMTP is already configured!${end}" || smtp_setup
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $backup ]]; then
+	[[ $import =~ ^(true|stack|full)$ || $backup == "local" ]] || check_for_nginx_tool_bkp -ask
+	
+	if [[ -n $list && -z $add_db_pre ]]; then
+		bkp_s3_list
+	elif [[ $backup == "local" ]]; then
+		if [[ -n $export ]]; then
+			[[ $export == "true" ]] && export_server || export_site
+		elif [[ -n $import ]]; then
+			import_server
+		else
+			bkp_local_db
+		fi
+	elif [[ $backup == "s3" ]]; then
+		[[ -n $send_to_s3 ]] && s3_send || bkp_s3_profile
+	else
+		bkp_wizard
+	fi
+	
+	[[ -z $import ]] && nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $aws_s3_credentials ]]; then
+	aws_s3_credentials
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $datadog ]]; then
+	if [[ -n $purge ]]; then
+		if [[ $integrations == "nginx" ]]; then
+			dd_nginx_purge
+		elif [[ $integrations == "fpm" ]]; then
+			dd_fpm_purge
+		elif [[ $integrations == "mysql" ]]; then
+			dd_mysql_purge
+		elif [[ $integrations == "redis" ]]; then
+			dd_redis_purge
+		elif [[ -n $integrations ]]; then
+			echo "${red}[ERROR] Invalid Datadog integration!${end}"
+			exit 1
+		else
+			dd_purge
+		fi
+		
+		
+		if [[ -n $integrations ]]; then
+			dd_logs_disable
+			sudo systemctl restart datadog-agent
+		fi
+		
+	elif [[ -n $integrations && $integrations != "off" ]]; then
+		if [[ ! -d /etc/datadog-agent ]]; then
+			echo "${red}[ERROR] Datadog Agent is not installed in your server!${end}"
+			exit 1
+		fi
+		
+		if [[ $integrations == "nginx" ]]; then
+			check_for_nginx
+			dd_nginx
+		elif [[ $integrations == "fpm" ]]; then
+			check_for_php
+			dd_fpm
+		elif [[ $integrations == "mysql" ]]; then
+			check_for_mysql
+			dd_mysql
+		elif [[ $integrations == "redis" ]]; then
+			check_for_php_tool_redis
+			dd_redis
+		else
+			echo "${red}[ERROR] Invalid Datadog integration!${end}"
+			exit 1
+		fi
+		
+		sudo systemctl restart datadog-agent
+	else
+		dd_install
+	fi
+
+
+elif [[ -n $db_import ]]; then
+	check_for_mysql
+	database_import
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $info ]]; then
+	system_info
+	nginx_not="true" # Nginx-Reload not-needed.
+
+
+elif [[ -n $custom_headers ]]; then
+	http_header_custom
+
+
+elif [[ -n $query_string_cache || -n $query_string_never_cache || -n $skip_cache || -n $skip_cookie_cache ]]; then
+	check_for_nginx
+	custom_cache_global
+elif [[ -n $query_string_cache_default ]]; then
+	echo "${red}[ERROR] This option (-query-string-cache-default) is only enabled for specific sites using Custom Cache!"
+	echo "${blu}${dim}The option you are looking for is only available in the Webinoly configuration file. (wpcache-query-strings)${end}"
+	exit 1
+
+
+elif [[ -n $email ]]; then
+	email_update
+	nginx_not="true" # Nginx-Reload not-needed.
+	
+	
+elif [[ -n $mysql_public_access ]]; then
+	mysql_public_access
+	nginx_not="true" # Nginx-Reload not-needed.
+	
+
+elif [[ -n $help || -n $h || -n $H || $empty_param == "true" ]]; then
+	help_message
+else
+	echo "${red}[ERROR] Please, enter a valid option!${end}"
+	exit 1
+fi
+
+
+[[ $(conf_read nginx) == "true" && -z $nginx_not ]] && sudo systemctl reload nginx
+[[ -n $err_cont ]] && exit 1
+[[ -z $ads_block ]] && ads_donate
+api-events_update wye
