@@ -2,12 +2,16 @@
 locale-gen en_US.UTF-8
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
-sudo apt install zip -y
-sudo apt install unzip -y
-sudo apt install htop -y
+sudo apt install -y htop zip unzip screen nano wget curl gpg
 sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/weby -O weby && sudo chmod +x weby && sudo ./weby -clean
 sudo rm /opt/webinoly/webinoly.conf
 sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/config/webinoly.conf -O /opt/webinoly/webinoly.conf
+sudo stack -lemp -build=light
+
+
+
+
+
 sudo stack -html
 sudo stack -php
 sudo apt-get remove memcached -y
