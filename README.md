@@ -7,7 +7,7 @@ sudo apt update && sudo apt upgrade -y && sudo reboot
 ```
 3. Install Webinoly PHP 7.4
 ```shell
-sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/setup/webinoly74.sh -O webinoly_mod.sh && sudo chmod +x webinoly_mod.sh && sudo ./webinoly_mod.sh
+sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/setup/webinoly74.sh -O /opt/webinoly_mod.sh && sudo chmod +x /opt/webinoly_mod.sh && sudo /opt/webinoly_mod.sh
 ```
 
 
