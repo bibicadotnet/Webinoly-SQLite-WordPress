@@ -13,5 +13,10 @@ sudo iptables -F
 sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/config/php.ini -O /etc/php/7.4/fpm/php.ini
 sudo service php7.4-fpm restart
 sudo apt update && sudo apt upgrade -y
+#addon
+curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+php wp-cli.phar --info
+chmod +x wp-cli.phar
+sudo mv wp-cli.phar /usr/local/bin/wp
 sudo webinoly -verify
 sudo webinoly -info
