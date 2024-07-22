@@ -7,7 +7,7 @@ sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/
 sudo rm /opt/webinoly/webinoly.conf
 sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/config/webinoly.conf -O /opt/webinoly/webinoly.conf
 sudo stack -nginx
-sudo stack -php-ver=7.4
+sudo stack -php
 sudo apt-get remove memcached -y
 sudo apt-get remove redis-server -y
 sudo apt remove iptables-persistent -y
