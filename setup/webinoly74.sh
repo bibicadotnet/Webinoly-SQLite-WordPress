@@ -6,7 +6,7 @@ sudo apt install -y htop zip unzip screen nano wget curl gpg
 sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/weby -O weby && sudo chmod +x weby && sudo ./weby -clean
 sudo rm /opt/webinoly/webinoly.conf
 sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/config/webinoly.conf -O /opt/webinoly/webinoly.conf
-sudo stack -lemp -build=light
+sudo stack -php-ver=7.4
 sudo apt remove iptables-persistent -y
 sudo ufw disable
 sudo iptables -F
