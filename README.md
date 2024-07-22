@@ -1,5 +1,5 @@
 # Webinoly-SQLite-WordPress
-Sử dụng phiên bản Webinoly v1.18.4 và bản WordPress từ [Docker SQLite WordPress](https://github.com/soulteary/docker-sqlite-wordpress)
+Sử dụng phiên bản Webinoly v1.18.4 và bản SQLite WordPress
 1. Login root
 2. Update IOS and reboot the system
 ```shell
