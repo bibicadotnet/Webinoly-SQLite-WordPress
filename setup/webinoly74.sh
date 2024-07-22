@@ -8,6 +8,7 @@ sudo rm /opt/webinoly/webinoly.conf
 sudo wget --no-check-certificate https://raw.githubusercontent.com/bibicadotnet/Webinoly-SQLite-WordPress/main/config/webinoly.conf -O /opt/webinoly/webinoly.conf
 sudo stack -nginx
 sudo stack -php
+sudo apt install php7.4-sqlite3
 sudo apt-get remove memcached -y
 sudo apt-get remove redis-server -y
 sudo apt remove iptables-persistent -y
